@@ -1,0 +1,5 @@
+__pycache__
+video
+tmp
+.DS_Store
+*.log
