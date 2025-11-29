@@ -2,7 +2,7 @@ import os
 import re
 import json
 import gradio as gr
-from typing import List, Tuple, Dict, Any, Iterator
+from typing import List, Tuple, Dict, Iterator
 import threading
 from queue import Queue, Empty
 
