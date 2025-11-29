@@ -195,7 +195,13 @@ def task_executor_thread(tasks: List[Dict], global_steps: List[Dict], queue: Que
 
 
 def predict(message: str, history: List[Tuple[str, str]]) -> Iterator[Tuple[List[Tuple[str, str]], str, str]]:
-    chat_history = [HumanMessage(content=user) if role == "user" else AIMessage(content=ai) for (role, user), (role, ai) in zip(history[::2], history[1::2])]
+    # 正确构建chat_history：从history中提取(user_message, ai_response)对
+    chat_history = []
+    for user_msg, ai_msg in history:
+        if user_msg:  # 用户消息不为空
+            chat_history.append(HumanMessage(content=user_msg))
+        if ai_msg:  # AI响应不为空
+            chat_history.append(AIMessage(content=ai_msg))
     
     q = Queue()
     log_content = "### 阶段一：任务规划\n"
@@ -247,8 +253,11 @@ def predict(message: str, history: List[Tuple[str, str]]) -> Iterator[Tuple[List
     try:
         plan = json.loads(plan_json_str)
         tasks = plan.get("tasks", [])
-        if not tasks:
-            yield history[:-1] + [[message, "计划中没有发现任何有效任务。"]], log_content
+        global_steps = plan.get("global_steps", [])
+        
+        # 检查是否有任何有效任务或全局步骤
+        if not tasks and not global_steps:
+            yield history[:-1] + [[message, "计划中没有发现任何有效任务或全局步骤。"]], log_content
             return
 
     except json.JSONDecodeError:
@@ -257,7 +266,6 @@ def predict(message: str, history: List[Tuple[str, str]]) -> Iterator[Tuple[List
 
     log_content += "\n### 阶段二：任务执行\n"
     
-    global_steps = plan.get("global_steps", [])
     executor_thread = threading.Thread(target=task_executor_thread, args=(tasks, global_steps, q))
     executor_thread.start()
 
