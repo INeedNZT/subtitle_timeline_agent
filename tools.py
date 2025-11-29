@@ -3,13 +3,20 @@ import shutil
 import json
 import subprocess
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
+from difflib import SequenceMatcher
 from langchain.tools import tool
 from pydantic.v1 import BaseModel, Field
+from langchain_openai import ChatOpenAI
 
-VIDEO_ROOT = os.getenv("VIDEO_ROOT", "/video")
-# Define root directory for operations
-ROOT_DIR = Path(VIDEO_ROOT).resolve()
+# Define root directory for video
+ROOT_DIR = Path("/video").resolve()
+
+# Initialize LLM for smart subtitle matching
+api_key = os.getenv("OPENAI_API_KEY", "")
+base_url = os.getenv("OPENAI_BASE_URL", "https://api.deepseek.com/v1")
+model = os.getenv("MODEL_NAME", "deepseek-chat")
+llm = ChatOpenAI(model=model, temperature=0, api_key=api_key, base_url=base_url)
 
 def get_safe_path(user_path: str) -> Path:
     """Ensure the path is within the allowed ROOT_DIR."""
@@ -174,26 +181,28 @@ def extract_subtitle(input_path: str, output_filename: str, stream_index: int = 
 
 class SyncSubtitleArgs(BaseModel):
     video_filename: str = Field(..., description="Name of the reference video file in tmp dir")
-    srt_filename: str = Field(..., description="Name of the subtitle file in tmp dir to sync")
-    output_srt_name: str = Field(..., description="Name for the synced output subtitle file. Identical to the video name, but with a `_synced` suffix appended.")
+    subtitle_filename: str = Field(..., description="Name of the subtitle file in tmp dir to sync")
+    output_subtitle_name: str = Field(..., description="Name for the synced output subtitle file. Identical to the video name, but with a `_synced` suffix appended.")
 
 @tool("sync_subtitles", args_schema=SyncSubtitleArgs)
-def sync_subtitles(video_filename: str, srt_filename: str, output_srt_name: str) -> Dict:
+def sync_subtitles(video_filename: str, subtitle_filename: str, output_subtitle_name: str) -> Dict:
     """
     Synchronize subtitles using ffsubsync. Both video and subtitle must be in the temporary directory.
     """
     try:
         tmp_dir = ROOT_DIR / "tmp"
         video_path = tmp_dir / video_filename
-        srt_path = tmp_dir / srt_filename
-        output_path = tmp_dir / output_srt_name
+        subtitle_path = tmp_dir / subtitle_filename
+        
+        original_ext = Path(subtitle_filename).suffix.lower()
+        output_path = tmp_dir / (Path(output_subtitle_name).stem + original_ext)
 
         if not video_path.exists():
             return {"status": "error", "message": f"Reference video not found at {video_filename}"}
-        if not srt_path.exists():
-            return {"status": "error", "message": f"Subtitle file not found at {srt_filename}"}
+        if not subtitle_path.exists():
+            return {"status": "error", "message": f"Subtitle file not found at {subtitle_filename}"}
 
-        cmd = ["ffs", str(video_path), "-i", str(srt_path), "-o", str(output_path)]
+        cmd = ["ffs", str(video_path), "-i", str(subtitle_path), "-o", str(output_path)]
         res = run_command(cmd)
 
         if res["status"] == "success":
@@ -258,22 +267,118 @@ def copy_to_temp(file_path: str) -> Dict:
 @tool("check_external_subtitle", args_schema=CheckSubtitleArgs)
 def check_external_subtitle(video_path: str) -> Dict:
     """
-    Check if there is an external subtitle file (same name as video) in the same directory.
-    Returns the path to the subtitle if found.
+    Check for external subtitle files that match the video semantically using LLM.
+    Returns matching subtitle file paths in JSON format.
+    Only returns subtitles that are semantically the same video.
+    
+    Returns:
+        {
+            "status": "success" or "error",
+            "subtitle_paths": ["path/to/subtitle1.srt", "path/to/subtitle2.srt"] or null,
+            "count": number of matched subtitles (if success)
+        }
     """
     try:
         target_path = get_safe_path(video_path)
         base_name = target_path.stem
         parent_dir = target_path.parent
         
+        # Step 1: Exact match first (check for exact filename matches)
+        exact_matches = []
         for ext in ['.srt', '.ass', '.vtt']:
             sub_path = parent_dir / (base_name + ext)
             if sub_path.exists():
-                return {"status": "success", "subtitle_path": str(sub_path.relative_to(ROOT_DIR))}
+                exact_matches.append(str(sub_path.relative_to(ROOT_DIR)))
         
-        return {"status": "success", "subtitle_path": None}
+        if exact_matches:
+            return {
+                "status": "success",
+                "subtitle_paths": exact_matches,
+                "count": len(exact_matches),
+                "match_type": "exact"
+            }
+        
+        # Step 2: Collect all subtitle candidates in the same directory
+        subtitle_extensions = {'.srt', '.ass', '.vtt'}
+        candidates = []
+        if parent_dir.exists():
+            for f in parent_dir.iterdir():
+                if f.is_file() and f.suffix.lower() in subtitle_extensions:
+                    candidates.append((f.stem, str(f.relative_to(ROOT_DIR)), f))
+        
+        if not candidates:
+            return {
+                "status": "success",
+                "subtitle_paths": None,
+                "count": 0,
+                "match_type": "none"
+            }
+        
+        # Step 3: Use LLM for semantic matching
+        candidate_info = [{"name": name, "path": rel_path} for name, rel_path, _ in candidates]
+        
+        # Enhanced prompt to ensure we get all semantically matching subtitles
+        prompt = f"""分析视频与字幕文件的对应关系。
+视频名称: {base_name}
+候选字幕文件列表: {json.dumps(candidate_info, ensure_ascii=False)}
+
+任务: 找出所有在语义上属于同一个视频的字幕文件。
+- 如果文件名明显是同一部视频的不同语言/版本字幕，全部返回
+- 只返回确实对应该视频的字幕文件
+- 如果没有匹配的字幕，返回"NONE"
+
+返回格式: 每行一个匹配的字幕文件路径(如: path/subtitle.srt),或返回"NONE"
+"""
+        
+        response = llm.invoke(prompt)
+        response_text = response.content.strip()
+        
+        # Parse LLM response
+        if response_text.upper() == "NONE":
+            return {
+                "status": "success",
+                "subtitle_paths": None,
+                "count": 0,
+                "match_type": "llm_no_match"
+            }
+        
+        # Extract matched subtitle paths from response
+        matched_paths = []
+        for line in response_text.split('\n'):
+            cleaned = line.strip()
+            if cleaned and cleaned.upper() != "NONE":
+                matched_paths.append(cleaned)
+        
+        # Validate paths exist in candidates
+        matched_files = []
+        candidate_paths = {rel_path: rel_path for _, rel_path, _ in candidates}
+        for path in matched_paths:
+            if path in candidate_paths:
+                matched_files.append(path)
+        
+        if matched_files:
+            return {
+                "status": "success",
+                "subtitle_paths": matched_files,
+                "count": len(matched_files),
+                "match_type": "llm"
+            }
+        
+        # No matches found
+        return {
+            "status": "success",
+            "subtitle_paths": None,
+            "count": 0,
+            "match_type": "llm_no_match"
+        }
+            
     except Exception as e:
-        return {"status": "error", "message": f"Error checking subtitle: {str(e)}"}
+        return {
+            "status": "error",
+            "subtitle_paths": None,
+            "count": 0,
+            "message": str(e)
+        }
 
 class CleanupSubtitleArgs(BaseModel):
     temp_dir: str = Field(default="tmp", description="The temporary directory path relative to ROOT_DIR")
@@ -282,8 +387,8 @@ class CleanupSubtitleArgs(BaseModel):
 def cleanup_subtitle(temp_dir: str = "tmp") -> Dict:
     """
     Clean up non-synced subtitle files and rename synced subtitle files in the temporary directory:
-    1. Delete all non-synced subtitle files (files without _sync suffix)
-    2. Rename synced subtitle files by removing the _sync suffix to match video names
+    1. Delete all non-synced subtitle files (files without _synced suffix)
+    2. Rename synced subtitle files by removing the _synced suffix to match video names
     Returns a summary of operations performed.
     """
     try:
@@ -307,9 +412,9 @@ def cleanup_subtitle(temp_dir: str = "tmp") -> Dict:
                 continue
             
             # Check if this is a synced subtitle file
-            if '_sync' in filename:
-                # Remove _sync suffix to match video name
-                new_filename = filename.replace('_sync', '')
+            if '_synced' in filename:
+                # Remove _synced suffix to match video name
+                new_filename = filename.replace('_synced', '')
                 new_path = tmp_path / new_filename
                 
                 try:

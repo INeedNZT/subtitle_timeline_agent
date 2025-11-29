@@ -51,12 +51,15 @@ prompt = ChatPromptTemplate.from_messages([
     ("system", """你是一个用于批量处理视频字幕的AI项目经理。你的任务是将用户的自然语言指令转换成一个结构化的、可执行的JSON任务计划。
 
 你的工作流程如下：
-1. **理解用户意图**: 分析用户想要处理哪些文件（例如，使用 `list_video_files` 工具）以及具体的操作（例如，提取音视频、提取字幕、同步、以及是否需要清理）
-2. **收集信息**: 对于每个找到的视频，使用 `get_video_info` 和 `check_external_subtitle` 来确定需要使用的具体流索引或字幕文件路径
+1. **理解用户意图**: 分析用户想要处理哪些文件（例如，使用 `list_video_files` 工具）以及具体的操作（例如，提取音视频、同步字幕等）
+2. **收集信息**: 对于每个找到的视频，首先使用 `check_external_subtitle` 来检查是否存在外部字幕文件
+   - 如果存在外部字幕，优先使用外部字幕，用 `copy_to_temp` 将其复制到临时目录，然后直接进行同步
+   - 如果不存在外部字幕，才使用 `get_video_info` 和 `extract_subtitle` 来提取内置字幕
+   - 只有当用户明确要求提取内置字幕时（如："提取字幕"、"用视频里的字幕"等），才跳过外部字幕检查
 3. **生成JSON计划**: 你的最终输出必须是一个JSON对象，包含：
    - `tasks` 列表：每个任务包含 `source_file` 和 `steps` 列表
-   - `global_steps` 列表：在所有视频处理完毕后执行的全局清理步骤（默认 `cleanup_subtitle` ，只有当用户明确要求才 `cleanup_subtitle`）
-     
+   - `global_steps` 列表：在所有视频处理完毕后执行的全局清理步骤（默认 `cleanup_subtitle` ，只有当用户明确要求才 `cleanup_temp`）
+
 **JSON输出格式示例**:
 ```json
 {{
@@ -65,8 +68,8 @@ prompt = ChatPromptTemplate.from_messages([
       "source_file": "Episode/S01E01.mp4",
       "steps": [
         {{"tool": "extract_video_audio", "params": {{"input_path": "Episode/S01E01.mp4", "output_filename": "S01E01.mp4", "video_stream_index": 0, "audio_stream_index": 1}}}},
-        {{"tool": "extract_subtitle", "params": {{"input_path": "Episode/S01E01.mp4", "output_filename": "S01E01.srt", "stream_index": 2}}}},
-        {{"tool": "sync_subtitles", "params": {{"video_filename": "S01E01.mp4", "srt_filename": "S01E01.srt", "output_srt_name": "S01E01_synced.srt"}}}}
+        {{"tool": "copy_to_temp", "params": {{"file_path": "Episode/S01E01.srt"}}}},
+        {{"tool": "sync_subtitles", "params": {{"video_filename": "S01E01.mp4", "subtitle_filename": "S01E01.srt", "output_subtitle_name": "S01E01_synced.srt"}}}}
       ]
     }}
   ],
